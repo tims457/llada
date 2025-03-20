@@ -8,6 +8,7 @@ dependencies = [
     "chex>=0.1.89",
     "datasets[jax]>=3.4.1",
     "datatrove[all]>=0.4.0",
+    "equinox>=0.11.12",
     "flax>=0.10.4",
     "jax[cuda12]>=0.5.2",
     "optax>=0.2.4",
