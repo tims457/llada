@@ -111,7 +111,7 @@ class LLaDABlock(eqx.Module):
         # ?? attention bias
         # ?? layer past
         q, k, v = jnp.split(jax.vmap(self.att_proj)(x_norm), 3, axis=1)
-        attn_out = self.attn(q, k, v, key=attn_key)
+        attn_out = self.attn(q, k, v, mask=None, key=attn_key)
         # dropout and skip connection
         # shape: (B, max_sequence_length, d_embed)
         x = x + self.drop(attn_out, key=drop1_key)
@@ -145,16 +145,24 @@ class Transformer(eqx.Module):
         self.blocks = [LLaDABlock(config, bkey) for _ in range(config.n_layers)]
         # TODO past key values
 
-    def __call__(self, input_ids: jnp.ndarray, key: jax.random.PRNGKey):
+    def __call__(self, input_ids: jax.Array, attn_mask: jax.Array | None = None, key: jax.random.PRNGKey = None):
         (t,) = input_ids.shape
-        chex.assert_shape(input_ids, (t,))
-
-        pos = jnp.arange(0, input_ids.shape[0], dtype=jnp.int64)
+        pos = jnp.arange(0, input_ids.shape[0], dtype=jnp.int32)
         token_emb = jax.vmap(self.wte)(input_ids)
         pos_emb = jax.vmap(self.wpe)(pos)
         x = self.drop(token_emb + pos_emb, key=key)
 
         # TODO attention mask
+        if attn_mask is not None:
+            attn_mask = jnp.where(attn_mask == 0, -jnp.inf, 0.0)
+
+        # attention bias
+        # the LLaDA code creates a casual attention mask 
+        # but doesn't use it
+
+
+        
+
         for block in self.blocks:
             x = block(x, key=key)
 
@@ -163,26 +171,31 @@ class Transformer(eqx.Module):
 
 class LLaDAModel(eqx.Module):
     transformer: Transformer
+    lm_head: eqx.nn.Linear
 
     def __init__(self, config: LLaDAConfig, key: jax.random.PRNGKey):
         tkey, lmhkey = jax.random.split(key, 2)
         self.transformer = Transformer(config, tkey)
-
-    def __call__(self, input_ids: jnp.ndarray, key: jax.random.PRNGKey = None):
+        self.lm_head = eqx.nn.Linear(config.d_embed, config.embedding_size, use_bias=False, key=lmhkey)
+    
+    def __call__(self, input_ids: jax.Array, key: jax.random.PRNGKey = None):
         if key is None:
             key = jax.random.PRNGKey(0)
-        return self.transformer(input_ids, key=key)
+        
+        x = self.transformer(input_ids, key=key)
+        logits = jax.vmap(self.lm_head)(x)
 
+        return logits
 
-transformer = Transformer(config, jax.random.PRNGKey(0))
+# transformer = Transformer(config, jax.random.PRNGKey(0))
 
-print(transformer(jnp.zeros(1024, dtype=jnp.int32), jax.random.PRNGKey(0)).shape)
-# check with vmap
-print(
-    jax.vmap(transformer, in_axes=(0, None))(
-        jnp.zeros((10, 1024), dtype=jnp.int32), jax.random.PRNGKey(0)
-    ).shape
-)
+# print(transformer(jnp.zeros(1024, dtype=jnp.int32), jax.random.PRNGKey(0)).shape)
+# # check with vmap
+# print(
+#     jax.vmap(transformer, in_axes=(0, None))(
+#         jnp.zeros((10, 1024), dtype=jnp.int32), jax.random.PRNGKey(0)
+#     ).shape
+# )
 
 # import time
 # # Add a jitted call to transformer with a test input
@@ -206,3 +219,36 @@ print(
 # non_jitted_end_time = time.time()
 # print(f"Non-jitted call execution time: {(non_jitted_end_time - non_jitted_start_time) * 1000:.2f} ms")
 # print(f"Speedup from jitting: {(non_jitted_end_time - non_jitted_start_time) / ((jitted_end_time - jitted_start_time) + 1e-10):.2f}x")
+
+
+# it looks like they just assign a token to the masked position
+# and don't use the attention mask for anything, instead computing the loss
+# on just the masked tokens
+def forward_process(input_ids, key, eps=1e-3):
+    key1, key2 = jax.random.split(key, 2)
+    b, l = input_ids.shape
+    p_mask = jax.random.uniform(key1, (b,), minval=eps, maxval=1.0)
+    p_mask = p_mask[:, None].repeat(l,1)
+
+    masked_indices = jax.random.uniform(key2, (b, l)) < p_mask
+    noisy_batch = jnp.where(masked_indices, 126336, input_ids)
+
+    return noisy_batch, masked_indices, p_mask
+
+input_ids = jax.random.randint(jax.random.PRNGKey(0), (2, 1024), 0, 10)
+
+noisy_batch, masked_indices, p_mask = forward_process(input_ids, jax.random.PRNGKey(0))
+print(noisy_batch)
+print(masked_indices)
+print(p_mask)
+
+model = LLaDAModel(config, jax.random.PRNGKey(0))
+logits = jax.vmap(model)(noisy_batch)
+print(logits.shape)
+
+# compute loss
+loss = optax.softmax_cross_entropy(logits[masked_indices], jax.nn.one_hot(input_ids[masked_indices], config.embedding_size)) / p_mask[masked_indices]
+print(loss)
+print(loss.shape)
+loss = loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
+print(loss)
