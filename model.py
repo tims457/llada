@@ -2,38 +2,12 @@ import jax
 import optax
 import equinox as eqx
 import jax.numpy as jnp
-from dataclasses import dataclass
-import chex
 
+from config import test_config, gpt2_config, LLaDAConfig
 
-@dataclass
-class LLaDAConfig:
-    vocab_size: int = 50257
+config = test_config
 
-    """The embedding size is set to the next multiple
-    of 128 that's greater than vocab_size to improve throughput"""
-    embedding_size: int = vocab_size + (128 - vocab_size % 128)
-
-    """embedding dimension / hidden size"""
-    d_embed: int = 768
-
-    """dropout probability"""
-    dropout: float = 0.1
-
-    """maximum sequence length"""
-    max_sequence_length: int = 1024
-
-    """number of attention heads"""
-    n_heads: int = 12
-
-    """number of layers"""
-    n_layers: int = 12
-
-    """mlp hidden size"""
-    mlp_hidden_size: int = 4 * d_embed
-
-
-config = LLaDAConfig()
+print(config)
 
 
 class SwiGLU(eqx.Module):
@@ -74,14 +48,14 @@ class LLaDABlock(eqx.Module):
     drop: eqx.nn.Dropout
 
     def __init__(self, config: LLaDAConfig, key: jax.random.PRNGKey):
-        ckey, akey, fkey, dkey = jax.random.split(key, 4)
+        a_key, f_key, ap_key, ffp_key, ffo_key, act_key = jax.random.split(key, 6)
         self.attn_norm = eqx.nn.LayerNorm(config.d_embed)
 
         self.ff_norm = eqx.nn.LayerNorm(config.d_embed)
-        self.ff = eqx.nn.Linear(config.d_embed, config.d_embed, key=fkey)
+        self.ff = eqx.nn.Linear(config.d_embed, config.d_embed, key=f_key)
         self.drop = eqx.nn.Dropout(config.dropout)
 
-        self.attn = eqx.nn.MultiheadAttention(config.n_heads, config.d_embed, key=akey)
+        self.attn = eqx.nn.MultiheadAttention(config.n_heads, config.d_embed, key=a_key)
         # x -> (q, k, v)
         head_dim = config.d_embed // config.n_heads
         self.fused_dims = (
@@ -91,12 +65,12 @@ class LLaDABlock(eqx.Module):
         )
         hidden_dim = config.mlp_hidden_size
         # attention input projection
-        self.att_proj = eqx.nn.Linear(config.d_embed, sum(self.fused_dims), key=akey)
+        self.att_proj = eqx.nn.Linear(config.d_embed, sum(self.fused_dims), key=ap_key)
         # feed forward input projection
-        self.ff_proj = eqx.nn.Linear(config.d_embed, hidden_dim, key=fkey)
+        self.ff_proj = eqx.nn.Linear(config.d_embed, hidden_dim, key=ffp_key)
         # feed forward output projection
-        self.ff_out = eqx.nn.Linear(hidden_dim, config.d_embed, key=fkey)
-        self.act = SwiGLU(hidden_dim, hidden_dim, key=fkey)
+        self.ff_out = eqx.nn.Linear(hidden_dim, config.d_embed, key=ffo_key)
+        self.act = SwiGLU(hidden_dim, hidden_dim, key=act_key)
 
     def __call__(self, x: jnp.ndarray, key: jax.random.PRNGKey):
         eqx.error_if(
@@ -107,7 +81,7 @@ class LLaDABlock(eqx.Module):
         attn_key, drop1_key, drop2_key = jax.random.split(key, 3)
         # TODO add RoPE
         x_norm = jax.vmap(self.attn_norm)(x)
-        # ?? cache
+        # LLaDA can't use KV cache since it's not autoregressive
         # ?? attention bias
         # ?? layer past
         q, k, v = jnp.split(jax.vmap(self.att_proj)(x_norm), 3, axis=1)
@@ -127,15 +101,13 @@ class LLaDABlock(eqx.Module):
 
 class Transformer(eqx.Module):
     config: LLaDAConfig
-    # word token embedding
-    wte: eqx.nn.Embedding
-    # position embedding
-    wpe: eqx.nn.Embedding
+    wte: eqx.nn.Embedding  # token embedding
+    wpe: eqx.nn.Embedding  # pos embedding
     drop: eqx.nn.Dropout
     blocks: list[LLaDABlock]
 
     def __init__(self, config: LLaDAConfig, key: jax.random.PRNGKey):
-        ekey, pkey, dkey, bkey = jax.random.split(key, 4)
+        ekey, pkey, bkey = jax.random.split(key, 3)
         self.config = config
         self.wte = eqx.nn.Embedding(config.embedding_size, config.d_embed, key=ekey)
         self.wpe = eqx.nn.Embedding(
@@ -145,26 +117,33 @@ class Transformer(eqx.Module):
         self.blocks = [LLaDABlock(config, bkey) for _ in range(config.n_layers)]
         # TODO past key values
 
-    def __call__(self, input_ids: jax.Array, attn_mask: jax.Array | None = None, key: jax.random.PRNGKey = None):
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        attn_mask: jax.Array | None = None,
+        key: jax.random.PRNGKey = None,
+    ):
+        drop_key, x_key = jax.random.split(key, 2)
         (t,) = input_ids.shape
+        eqx.error_if(
+            t > self.config.max_sequence_length,
+            f"Expected sequence length <= {self.config.max_sequence_length}, got {t}",
+        )
         pos = jnp.arange(0, input_ids.shape[0], dtype=jnp.int32)
         token_emb = jax.vmap(self.wte)(input_ids)
         pos_emb = jax.vmap(self.wpe)(pos)
-        x = self.drop(token_emb + pos_emb, key=key)
+        x = self.drop(token_emb + pos_emb, key=drop_key)
 
-        # TODO attention mask
         if attn_mask is not None:
             attn_mask = jnp.where(attn_mask == 0, -jnp.inf, 0.0)
 
         # attention bias
-        # the LLaDA code creates a casual attention mask 
+        # the LLaDA code creates a casual attention mask
         # but doesn't use it
 
-
-        
-
         for block in self.blocks:
-            x = block(x, key=key)
+            # FIXME key
+            x = block(x, key=x_key)
 
         return x
 
@@ -176,19 +155,30 @@ class LLaDAModel(eqx.Module):
     def __init__(self, config: LLaDAConfig, key: jax.random.PRNGKey):
         tkey, lmhkey = jax.random.split(key, 2)
         self.transformer = Transformer(config, tkey)
-        self.lm_head = eqx.nn.Linear(config.d_embed, config.embedding_size, use_bias=False, key=lmhkey)
-    
+        self.lm_head = eqx.nn.Linear(
+            config.d_embed, config.embedding_size, use_bias=False, key=lmhkey
+        )
+
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def get_num_params(self):
+        n_params = sum(
+            x.size for x in jax.tree_util.tree_leaves(eqx.filter(self, eqx.is_array))
+        )
+
+        return n_params
+
     def __call__(self, input_ids: jax.Array, key: jax.random.PRNGKey = None):
         if key is None:
             key = jax.random.PRNGKey(0)
-        
+
         x = self.transformer(input_ids, key=key)
         logits = jax.vmap(self.lm_head)(x)
 
         return logits
 
-# transformer = Transformer(config, jax.random.PRNGKey(0))
 
+# transformer = Transformer(config, jax.random.PRNGKey(0))
 # print(transformer(jnp.zeros(1024, dtype=jnp.int32), jax.random.PRNGKey(0)).shape)
 # # check with vmap
 # print(
@@ -196,13 +186,11 @@ class LLaDAModel(eqx.Module):
 #         jnp.zeros((10, 1024), dtype=jnp.int32), jax.random.PRNGKey(0)
 #     ).shape
 # )
-
 # import time
 # # Add a jitted call to transformer with a test input
 # @jax.jit
 # def jitted_transformer_call(input_ids, key):
 #     return transformer(input_ids, key)
-
 # # Test the jitted function
 # test_input = jnp.zeros(1024, dtype=jnp.int32)
 # test_key = jax.random.PRNGKey(42)
@@ -212,43 +200,9 @@ class LLaDAModel(eqx.Module):
 # jitted_end_time = time.time()
 # print(f"Jitted transformer call output shape: {jitted_output.shape}")
 # print(f"Jitted call execution time: {(jitted_end_time - jitted_start_time) * 1000:.2f} ms")
-
 # # Compare with non-jitted call
 # non_jitted_start_time = time.time()
 # non_jitted_output = transformer(test_input, test_key)
 # non_jitted_end_time = time.time()
 # print(f"Non-jitted call execution time: {(non_jitted_end_time - non_jitted_start_time) * 1000:.2f} ms")
 # print(f"Speedup from jitting: {(non_jitted_end_time - non_jitted_start_time) / ((jitted_end_time - jitted_start_time) + 1e-10):.2f}x")
-
-
-# it looks like they just assign a token to the masked position
-# and don't use the attention mask for anything, instead computing the loss
-# on just the masked tokens
-def forward_process(input_ids, key, eps=1e-3):
-    key1, key2 = jax.random.split(key, 2)
-    b, l = input_ids.shape
-    p_mask = jax.random.uniform(key1, (b,), minval=eps, maxval=1.0)
-    p_mask = p_mask[:, None].repeat(l,1)
-
-    masked_indices = jax.random.uniform(key2, (b, l)) < p_mask
-    noisy_batch = jnp.where(masked_indices, 126336, input_ids)
-
-    return noisy_batch, masked_indices, p_mask
-
-input_ids = jax.random.randint(jax.random.PRNGKey(0), (2, 1024), 0, 10)
-
-noisy_batch, masked_indices, p_mask = forward_process(input_ids, jax.random.PRNGKey(0))
-print(noisy_batch)
-print(masked_indices)
-print(p_mask)
-
-model = LLaDAModel(config, jax.random.PRNGKey(0))
-logits = jax.vmap(model)(noisy_batch)
-print(logits.shape)
-
-# compute loss
-loss = optax.softmax_cross_entropy(logits[masked_indices], jax.nn.one_hot(input_ids[masked_indices], config.embedding_size)) / p_mask[masked_indices]
-print(loss)
-print(loss.shape)
-loss = loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
-print(loss)

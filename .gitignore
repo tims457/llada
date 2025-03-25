@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 llada.code-workspace
 .vscode/launch.json
+out.txt
