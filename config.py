@@ -46,6 +46,9 @@ class LLaDAConfig:
     """precision"""
     # TODO precision
 
+    """batch size"""
+    batch_size: int = 128
+
     def __post_init__(self):
         if self.embedding_size is None:
             self.embedding_size = self.vocab_size + (128 - self.vocab_size % 128)
